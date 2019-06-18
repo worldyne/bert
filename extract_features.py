@@ -12,6 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+
+
 """Extract pre-computed feature vectors from BERT."""
 
 from __future__ import absolute_import
@@ -22,11 +25,19 @@ import codecs
 import collections
 import json
 import re
+from . import tokenization
+from . import modeling
 
-import modeling
-import tokenization
 import tensorflow as tf
-
+BERT_PRETRAINED_DIR = '/Users/lawrencechew/Google Drive/flatiron_school/final_projects/module_4_project/BERT_keras/wwm_cased_L-24_H-1024_A-16'
+LAYERS = [-1,-2,-3,-4]
+NUM_TPU_CORES = 8
+MAX_SEQ_LENGTH = 128
+BERT_CONFIG = BERT_PRETRAINED_DIR + '/bert_config.json'
+CHKPT_DIR = BERT_PRETRAINED_DIR + '/bert_model.ckpt'
+VOCAB_FILE = BERT_PRETRAINED_DIR + '/vocab.txt'
+INIT_CHECKPOINT = BERT_PRETRAINED_DIR + '/bert_model.ckpt'
+BATCH_SIZE = 128
 flags = tf.flags
 
 FLAGS = flags.FLAGS
@@ -338,6 +349,77 @@ def read_examples(input_file):
           InputExample(unique_id=unique_id, text_a=text_a, text_b=text_b))
       unique_id += 1
   return examples
+
+
+def read_sequence(input_sentences):
+  examples = []
+  unique_id = 0
+  for sentence in input_sentences:
+    line = tokenization.convert_to_unicode(sentence)
+    examples.append(InputExample(unique_id=unique_id, text_a=line))
+    unique_id += 1
+  return examples
+
+def get_features(input_text, dim=768):
+#   tf.logging.set_verbosity(tf.logging.INFO)
+
+  layer_indexes = LAYERS
+
+  bert_config = modeling.BertConfig.from_json_file(BERT_CONFIG)
+
+  tokenizer = tokenization.FullTokenizer(
+      vocab_file=VOCAB_FILE, do_lower_case=True)
+
+  is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
+  tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(TPU_ADDRESS)
+  run_config = tf.contrib.tpu.RunConfig(
+      cluster=tpu_cluster_resolver,
+      tpu_config=tf.contrib.tpu.TPUConfig(
+          num_shards=NUM_TPU_CORES,
+          per_host_input_for_training=is_per_host))
+
+  examples = read_sequence(input_text)
+
+  features = convert_examples_to_features(
+      examples=examples, seq_length=MAX_SEQ_LENGTH, tokenizer=tokenizer)
+
+  unique_id_to_feature = {}
+  for feature in features:
+    unique_id_to_feature[feature.unique_id] = feature
+
+  model_fn = model_fn_builder(
+      bert_config=bert_config,
+      init_checkpoint=INIT_CHECKPOINT,
+      layer_indexes=layer_indexes,
+      use_tpu=True,
+      use_one_hot_embeddings=True)
+
+  # If TPU is not available, this will fall back to normal Estimator on CPU
+  # or GPU.
+  estimator = tf.contrib.tpu.TPUEstimator(
+      use_tpu=True,
+      model_fn=model_fn,
+      config=run_config,
+      predict_batch_size=BATCH_SIZE,
+      train_batch_size=BATCH_SIZE)
+
+  input_fn = input_fn_builder(
+      features=features, seq_length=MAX_SEQ_LENGTH)
+
+  # Get features
+  for result in estimator.predict(input_fn, yield_single_examples=True):
+    unique_id = int(result["unique_id"])
+    feature = unique_id_to_feature[unique_id]
+    output = collections.OrderedDict()
+    for (i, token) in enumerate(feature.tokens):
+      layers = []
+      for (j, layer_index) in enumerate(layer_indexes):
+        layer_output = result["layer_output_%d" % j]
+        layer_output_flat = np.array([x for x in layer_output[i:(i + 1)].flat])
+        layers.append(layer_output_flat)
+      output[token] = sum(layers)[:dim]
+
+  return output
 
 
 def main(_):
